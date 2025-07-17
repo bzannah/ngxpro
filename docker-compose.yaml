@@ -1,0 +1,198 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: ngfx_postgres
+    environment:
+      POSTGRES_USER: ngfx_user
+      POSTGRES_PASSWORD: ngfx_password
+      POSTGRES_DB: ngfx_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ngfx_user -d ngfx_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: ngfx_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.11-slim
+    container_name: ngfx_mlflow
+    working_dir: /app
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://ngfx_user:ngfx_password@postgres:5432/ngfx_db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/app/mlruns
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./requirements_mlflow.txt:/app/requirements.txt
+    ports:
+      - "5001:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: |
+      sh -c "
+        pip install --no-cache-dir -r requirements.txt &&
+        mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql://ngfx_user:ngfx_password@postgres:5432/ngfx_db --default-artifact-root /app/mlruns
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Prefect Server
+  prefect:
+    image: prefecthq/prefect:2.14-python3.11
+    container_name: ngfx_prefect
+    environment:
+      - PREFECT_API_URL=http://0.0.0.0:4200/api
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_SERVER_API_PORT=4200
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://ngfx_user:ngfx_password@postgres:5432/ngfx_db
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: prefect server start --host 0.0.0.0 --port 4200
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # NG FX Predictor API
+  ngfx_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ngfx_api
+    environment:
+      - DATABASE_URL=postgresql://ngfx_user:ngfx_password@postgres:5432/ngfx_db
+      - REDIS_URL=redis://redis:6379/0
+      - MLFLOW_TRACKING_URI=http://localhost:5001
+      - PREFECT_API_URL=http://localhost:4200/api
+      - DEBUG=false
+      - USE_MOCK_DATA=true
+      - MOCK_DATA_PATH=/app/data/mock
+      - LOG_LEVEL=INFO
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data/mock:/app/data/mock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Prefect Worker (for running flows)
+  prefect_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ngfx_prefect_worker
+    environment:
+      - DATABASE_URL=postgresql://ngfx_user:ngfx_password@postgres:5432/ngfx_db
+      - REDIS_URL=redis://redis:6379/0
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PREFECT_API_URL=http://prefect:4200/api
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      prefect:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    command: prefect worker start --pool default-pool
+    restart: unless-stopped
+
+  # Prometheus (optional monitoring)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ngfx_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - ngfx_api
+    restart: unless-stopped
+
+  # Grafana (optional monitoring)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ngfx_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  default:
+    driver: bridge 
