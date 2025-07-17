@@ -689,7 +689,8 @@ class DataValidator:
             
             # Check for sudden changes
             pct_changes = features[feature].pct_change()
-            extreme_changes = pct_changes.filter(pl.col(feature).abs() > self.thresholds['max_value_change_pct'] / 100)
+            # Filter extreme changes using Series operations
+            extreme_changes = pct_changes.filter(pct_changes.abs() > self.thresholds['max_value_change_pct'] / 100)
             
             if len(extreme_changes) > 0:
                 results.append(ValidationResult(
