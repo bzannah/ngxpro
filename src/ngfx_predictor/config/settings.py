@@ -101,10 +101,18 @@ class DataSourceSettings(BaseModel):
         default="https://api.worldbank.org/v2",
         description="World Bank API base URL"
     )
+    worldbank_api_key: Optional[str] = Field(
+        default=None,
+        description="World Bank API key"
+    )
     
     dmo_api_base_url: str = Field(
         default="https://www.dmo.gov.ng",
         description="DMO API base URL"
+    )
+    dmo_api_key: Optional[str] = Field(
+        default=None,
+        description="DMO API key"
     )
     
     eia_api_base_url: str = Field(

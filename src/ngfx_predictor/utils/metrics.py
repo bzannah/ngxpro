@@ -20,16 +20,80 @@ logger = get_logger(__name__)
 class MetricsManager:
     """Metrics collection and management."""
     
+    _instance = None
+    _prometheus_initialized = False
+    
+    def __new__(cls):
+        """Singleton pattern to prevent multiple Prometheus registrations."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
     def __init__(self):
         """Initialize metrics manager."""
+        # Skip initialization if already done (singleton)
+        if hasattr(self, '_initialized'):
+            return
+            
         self.settings = get_settings()
         self.metrics: Dict[str, Any] = {}
         self.custom_metrics: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         
         if PROMETHEUS_AVAILABLE and self.settings.monitoring.metrics_enabled:
-            self._init_prometheus_metrics()
+            if not self._prometheus_initialized:
+                self._init_prometheus_metrics()
+                MetricsManager._prometheus_initialized = True
         
+        self._initialized = True
         logger.info("Metrics manager initialized")
+    
+    def timer(self, operation_name: str, **labels):
+        """Create a timer context manager.
+        
+        Args:
+            operation_name: Name of the operation
+            **labels: Additional labels
+            
+        Returns:
+            PerformanceTimer context manager
+        """
+        return PerformanceTimer(self, operation_name, **labels)
+    
+    def increment(self, metric_name: str, value: int = 1, **labels):
+        """Increment a counter metric.
+        
+        Args:
+            metric_name: Name of the metric
+            value: Value to increment by
+            **labels: Additional labels
+        """
+        timestamp = datetime.utcnow().isoformat()
+        self.custom_metrics[metric_name].append({
+            'timestamp': timestamp,
+            'value': value,
+            'labels': labels
+        })
+        
+        # Log the increment
+        logger.debug(f"Incremented {metric_name} by {value}")
+    
+    def gauge(self, metric_name: str, value: float, **labels):
+        """Set a gauge metric value.
+        
+        Args:
+            metric_name: Name of the metric
+            value: Value to set
+            **labels: Additional labels
+        """
+        timestamp = datetime.utcnow().isoformat()
+        self.custom_metrics[metric_name].append({
+            'timestamp': timestamp,
+            'value': value,
+            'labels': labels
+        })
+        
+        # Log the gauge
+        logger.debug(f"Set gauge {metric_name} to {value}")
     
     def _init_prometheus_metrics(self) -> None:
         """Initialize Prometheus metrics."""
