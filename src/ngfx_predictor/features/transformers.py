@@ -47,13 +47,16 @@ class LagFeatureTransformer(BaseTransformer):
         Returns:
             DataFrame with lag features
         """
+        if df.is_empty():
+            return df
+            
         # Select numeric columns for lag features
         numeric_cols = [
             col for col in df.columns 
-            if df[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]
-            and col not in ['year', 'month', 'quarter', 'weekday', 'day_of_year']
+            if col != 'date' and df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
         ]
         
+        # Create lag features
         for col in numeric_cols:
             for lag in self.lag_days:
                 lag_col_name = f"{col}_lag_{lag}"
@@ -62,7 +65,6 @@ class LagFeatureTransformer(BaseTransformer):
                 ])
         
         logger.info(f"Created {len(numeric_cols) * len(self.lag_days)} lag features")
-        
         return df
 
 
@@ -73,9 +75,9 @@ class RollingStatsTransformer(BaseTransformer):
         """Initialize rolling stats transformer.
         
         Args:
-            windows: List of window sizes for rolling stats
+            windows: List of rolling window sizes
         """
-        self.windows = windows or [7, 14, 30]
+        self.windows = windows or [3, 7, 14, 30]
     
     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
         """Create rolling statistics features.
@@ -86,52 +88,59 @@ class RollingStatsTransformer(BaseTransformer):
         Returns:
             DataFrame with rolling statistics
         """
-        # Select numeric columns
+        if df.is_empty():
+            return df
+            
+        # Select numeric columns for rolling stats
         numeric_cols = [
             col for col in df.columns 
-            if df[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]
-            and col not in ['year', 'month', 'quarter', 'weekday', 'day_of_year']
-            and not col.endswith('_lag_')  # Skip lag features
+            if col != 'date' and df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
+            and not col.startswith('lag_')  # Skip lag features
         ]
         
+        # Create rolling statistics
         for col in numeric_cols:
             for window in self.windows:
                 # Rolling mean
                 df = df.with_columns([
-                    pl.col(col).rolling_mean(window_size=window)
-                    .alias(f"{col}_rolling_mean_{window}")
+                    pl.col(col).rolling_mean(window).alias(f"{col}_rolling_mean_{window}")
                 ])
                 
                 # Rolling std
                 df = df.with_columns([
-                    pl.col(col).rolling_std(window_size=window)
-                    .alias(f"{col}_rolling_std_{window}")
+                    pl.col(col).rolling_std(window).alias(f"{col}_rolling_std_{window}")
                 ])
                 
-                # Rolling min/max
+                # Rolling min
                 df = df.with_columns([
-                    pl.col(col).rolling_min(window_size=window)
-                    .alias(f"{col}_rolling_min_{window}"),
-                    
-                    pl.col(col).rolling_max(window_size=window)
-                    .alias(f"{col}_rolling_max_{window}")
+                    pl.col(col).rolling_min(window).alias(f"{col}_rolling_min_{window}")
                 ])
                 
-                # Price range (for rate columns)
-                if 'rate' in col or 'price' in col:
-                    df = df.with_columns([
-                        (pl.col(f"{col}_rolling_max_{window}") - 
-                         pl.col(f"{col}_rolling_min_{window}"))
-                        .alias(f"{col}_rolling_range_{window}")
-                    ])
+                # Rolling max
+                df = df.with_columns([
+                    pl.col(col).rolling_max(window).alias(f"{col}_rolling_max_{window}")
+                ])
         
-        logger.info(f"Created rolling statistics for {len(numeric_cols)} columns")
-        
+        logger.info(f"Created {len(numeric_cols) * len(self.windows) * 4} rolling statistics features")
         return df
 
 
 class TechnicalIndicatorTransformer(BaseTransformer):
-    """Create technical indicators for financial time series."""
+    """Create technical indicator features."""
+    
+    def __init__(self, rsi_window: int = 14, macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9):
+        """Initialize technical indicator transformer.
+        
+        Args:
+            rsi_window: RSI calculation window
+            macd_fast: MACD fast period
+            macd_slow: MACD slow period
+            macd_signal: MACD signal period
+        """
+        self.rsi_window = rsi_window
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
     
     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
         """Create technical indicators.
@@ -142,44 +151,48 @@ class TechnicalIndicatorTransformer(BaseTransformer):
         Returns:
             DataFrame with technical indicators
         """
-        # Calculate RSI for rate columns
-        rate_cols = [col for col in df.columns if 'rate' in col and 'official' in col]
+        if df.is_empty():
+            return df
+            
+        # Select price columns for technical indicators
+        price_cols = [
+            col for col in df.columns 
+            if any(keyword in col.lower() for keyword in ['rate', 'price', 'exchange'])
+            and df[col].dtype in [pl.Float64, pl.Float32]
+        ]
         
-        for col in rate_cols:
-            df = self._add_rsi(df, col, period=14)
+        for col in price_cols:
+            # RSI
+            df = self._calculate_rsi(df, col)
+            
+            # MACD
+            df = self._calculate_macd(df, col)
+            
+            # Bollinger Bands
+            df = self._calculate_bollinger_bands(df, col)
+            
+            # Price momentum
+            df = self._calculate_momentum(df, col)
         
-        # Calculate MACD for rate columns
-        for col in rate_cols:
-            df = self._add_macd(df, col)
-        
-        # Bollinger Bands for rate columns
-        for col in rate_cols:
-            df = self._add_bollinger_bands(df, col, window=20)
-        
-        # Calculate volatility indicators
-        df = self._add_volatility_indicators(df)
-        
-        logger.info("Added technical indicators")
-        
+        logger.info(f"Created technical indicators for {len(price_cols)} price columns")
         return df
     
-    def _add_rsi(self, df: pl.DataFrame, col: str, period: int = 14) -> pl.DataFrame:
-        """Add RSI (Relative Strength Index).
+    def _calculate_rsi(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
+        """Calculate RSI (Relative Strength Index).
         
         Args:
             df: Input DataFrame
-            col: Column name
-            period: RSI period
+            col: Column name to calculate RSI for
             
         Returns:
-            DataFrame with RSI
+            DataFrame with RSI column
         """
-        # Calculate price changes
+        # Calculate daily changes
         df = df.with_columns([
             (pl.col(col) - pl.col(col).shift(1)).alias(f"{col}_change")
         ])
         
-        # Separate gains and losses
+        # Calculate gains and losses
         df = df.with_columns([
             pl.when(pl.col(f"{col}_change") > 0)
             .then(pl.col(f"{col}_change"))
@@ -192,135 +205,133 @@ class TechnicalIndicatorTransformer(BaseTransformer):
             .alias(f"{col}_loss")
         ])
         
-        # Calculate average gains and losses
+        # Calculate rolling averages
         df = df.with_columns([
-            pl.col(f"{col}_gain").rolling_mean(window_size=period).alias(f"{col}_avg_gain"),
-            pl.col(f"{col}_loss").rolling_mean(window_size=period).alias(f"{col}_avg_loss")
+            pl.col(f"{col}_gain").rolling_mean(self.rsi_window).alias(f"{col}_avg_gain"),
+            pl.col(f"{col}_loss").rolling_mean(self.rsi_window).alias(f"{col}_avg_loss")
         ])
         
         # Calculate RSI
         df = df.with_columns([
             (100 - (100 / (1 + pl.col(f"{col}_avg_gain") / pl.col(f"{col}_avg_loss"))))
-            .alias(f"{col}_rsi_{period}")
+            .alias(f"{col}_rsi")
         ])
         
-        # Clean up intermediate columns
-        df = df.drop([f"{col}_change", f"{col}_gain", f"{col}_loss", 
-                      f"{col}_avg_gain", f"{col}_avg_loss"])
+        # Clean up temporary columns
+        df = df.drop([f"{col}_change", f"{col}_gain", f"{col}_loss", f"{col}_avg_gain", f"{col}_avg_loss"])
         
         return df
     
-    def _add_macd(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
-        """Add MACD (Moving Average Convergence Divergence).
+    def _calculate_macd(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
+        """Calculate MACD (Moving Average Convergence Divergence).
         
         Args:
             df: Input DataFrame
-            col: Column name
+            col: Column name to calculate MACD for
             
         Returns:
-            DataFrame with MACD
+            DataFrame with MACD columns
         """
         # Calculate EMAs
         df = df.with_columns([
-            pl.col(col).ewm_mean(span=12).alias(f"{col}_ema_12"),
-            pl.col(col).ewm_mean(span=26).alias(f"{col}_ema_26")
+            pl.col(col).ewm_mean(span=self.macd_fast).alias(f"{col}_ema_fast"),
+            pl.col(col).ewm_mean(span=self.macd_slow).alias(f"{col}_ema_slow")
         ])
         
         # Calculate MACD line
         df = df.with_columns([
-            (pl.col(f"{col}_ema_12") - pl.col(f"{col}_ema_26")).alias(f"{col}_macd")
+            (pl.col(f"{col}_ema_fast") - pl.col(f"{col}_ema_slow")).alias(f"{col}_macd")
         ])
         
         # Calculate signal line
         df = df.with_columns([
-            pl.col(f"{col}_macd").ewm_mean(span=9).alias(f"{col}_macd_signal")
+            pl.col(f"{col}_macd").ewm_mean(span=self.macd_signal).alias(f"{col}_macd_signal")
         ])
         
         # Calculate histogram
         df = df.with_columns([
-            (pl.col(f"{col}_macd") - pl.col(f"{col}_macd_signal")).alias(f"{col}_macd_hist")
+            (pl.col(f"{col}_macd") - pl.col(f"{col}_macd_signal")).alias(f"{col}_macd_histogram")
         ])
         
-        # Clean up intermediate columns
-        df = df.drop([f"{col}_ema_12", f"{col}_ema_26"])
+        # Clean up temporary columns
+        df = df.drop([f"{col}_ema_fast", f"{col}_ema_slow"])
         
         return df
     
-    def _add_bollinger_bands(self, df: pl.DataFrame, col: str, window: int = 20) -> pl.DataFrame:
-        """Add Bollinger Bands.
+    def _calculate_bollinger_bands(self, df: pl.DataFrame, col: str, window: int = 20, num_std: float = 2.0) -> pl.DataFrame:
+        """Calculate Bollinger Bands.
         
         Args:
             df: Input DataFrame
-            col: Column name
-            window: Window size
+            col: Column name to calculate Bollinger Bands for
+            window: Rolling window size
+            num_std: Number of standard deviations
             
         Returns:
-            DataFrame with Bollinger Bands
+            DataFrame with Bollinger Bands columns
         """
-        # Calculate moving average and standard deviation
+        # Calculate rolling mean and std
         df = df.with_columns([
-            pl.col(col).rolling_mean(window_size=window).alias(f"{col}_bb_middle"),
-            pl.col(col).rolling_std(window_size=window).alias(f"{col}_bb_std")
+            pl.col(col).rolling_mean(window).alias(f"{col}_bb_middle"),
+            pl.col(col).rolling_std(window).alias(f"{col}_bb_std")
         ])
         
-        # Calculate bands
+        # Calculate upper and lower bands
         df = df.with_columns([
-            (pl.col(f"{col}_bb_middle") + 2 * pl.col(f"{col}_bb_std")).alias(f"{col}_bb_upper"),
-            (pl.col(f"{col}_bb_middle") - 2 * pl.col(f"{col}_bb_std")).alias(f"{col}_bb_lower")
+            (pl.col(f"{col}_bb_middle") + num_std * pl.col(f"{col}_bb_std")).alias(f"{col}_bb_upper"),
+            (pl.col(f"{col}_bb_middle") - num_std * pl.col(f"{col}_bb_std")).alias(f"{col}_bb_lower")
         ])
         
-        # Calculate band width and position
+        # Calculate bandwidth and %B
         df = df.with_columns([
-            (pl.col(f"{col}_bb_upper") - pl.col(f"{col}_bb_lower")).alias(f"{col}_bb_width"),
+            (pl.col(f"{col}_bb_upper") - pl.col(f"{col}_bb_lower")).alias(f"{col}_bb_bandwidth"),
             ((pl.col(col) - pl.col(f"{col}_bb_lower")) / 
-             (pl.col(f"{col}_bb_upper") - pl.col(f"{col}_bb_lower"))).alias(f"{col}_bb_position")
+             (pl.col(f"{col}_bb_upper") - pl.col(f"{col}_bb_lower"))).alias(f"{col}_bb_percent")
         ])
         
-        # Clean up intermediate columns
+        # Clean up temporary columns
         df = df.drop([f"{col}_bb_std"])
         
         return df
     
-    def _add_volatility_indicators(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Add volatility indicators.
+    def _calculate_momentum(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
+        """Calculate momentum indicators.
         
         Args:
             df: Input DataFrame
+            col: Column name to calculate momentum for
             
         Returns:
-            DataFrame with volatility indicators
+            DataFrame with momentum columns
         """
-        # Calculate daily returns for rate columns
-        rate_cols = [col for col in df.columns if 'rate' in col and 'official' in col]
+        # Price momentum (% change over different periods)
+        for period in [5, 10, 20]:
+            df = df.with_columns([
+                ((pl.col(col) - pl.col(col).shift(period)) / pl.col(col).shift(period) * 100)
+                .alias(f"{col}_momentum_{period}")
+            ])
         
-        for col in rate_cols:
-            # Daily returns
-            df = df.with_columns([
-                ((pl.col(col) - pl.col(col).shift(1)) / pl.col(col).shift(1) * 100)
-                .alias(f"{col}_returns")
-            ])
-            
-            # Historical volatility (20-day)
-            df = df.with_columns([
-                pl.col(f"{col}_returns").rolling_std(window_size=20)
-                .alias(f"{col}_volatility_20")
-            ])
-            
-            # GARCH-like conditional volatility
-            df = df.with_columns([
-                (pl.col(f"{col}_returns").pow(2).rolling_mean(window_size=5))
-                .sqrt()
-                .alias(f"{col}_conditional_vol")
-            ])
+        # Rate of change
+        df = df.with_columns([
+            (pl.col(col) / pl.col(col).shift(10) - 1).alias(f"{col}_roc_10")
+        ])
         
         return df
 
 
 class SentimentTransformer(BaseTransformer):
-    """Transform sentiment data into features."""
+    """Create sentiment-based features."""
+    
+    def __init__(self, sentiment_window: int = 7):
+        """Initialize sentiment transformer.
+        
+        Args:
+            sentiment_window: Window for sentiment aggregation
+        """
+        self.sentiment_window = sentiment_window
     
     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Transform sentiment features.
+        """Create sentiment features.
         
         Args:
             df: Input DataFrame
@@ -328,38 +339,38 @@ class SentimentTransformer(BaseTransformer):
         Returns:
             DataFrame with sentiment features
         """
-        sentiment_cols = [col for col in df.columns if 'sentiment' in col]
+        if df.is_empty():
+            return df
+            
+        # Find sentiment columns
+        sentiment_cols = [
+            col for col in df.columns 
+            if 'sentiment' in col.lower()
+        ]
         
         if not sentiment_cols:
-            logger.warning("No sentiment columns found")
+            logger.info("No sentiment columns found, skipping sentiment transformation")
             return df
         
         for col in sentiment_cols:
-            if 'score' in col:
-                # Sentiment momentum
-                df = df.with_columns([
-                    (pl.col(col) - pl.col(col).shift(1)).alias(f"{col}_momentum"),
-                    (pl.col(col) - pl.col(col).shift(7)).alias(f"{col}_weekly_change")
-                ])
-                
-                # Sentiment volatility
-                df = df.with_columns([
-                    pl.col(col).rolling_std(window_size=7).alias(f"{col}_volatility")
-                ])
-                
-                # Sentiment categories
-                df = df.with_columns([
-                    pl.when(pl.col(col) > 0.5).then(1)
-                    .when(pl.col(col) < -0.5).then(-1)
-                    .otherwise(0)
-                    .alias(f"{col}_category")
-                ])
-                
-                # Cumulative sentiment
-                df = df.with_columns([
-                    pl.col(col).cumsum().alias(f"{col}_cumulative")
-                ])
+            # Rolling sentiment statistics
+            df = df.with_columns([
+                pl.col(col).rolling_mean(self.sentiment_window).alias(f"{col}_rolling_mean"),
+                pl.col(col).rolling_std(self.sentiment_window).alias(f"{col}_rolling_std")
+            ])
+            
+            # Sentiment momentum
+            df = df.with_columns([
+                (pl.col(col) - pl.col(col).shift(1)).alias(f"{col}_change"),
+                (pl.col(col) - pl.col(col).shift(self.sentiment_window)).alias(f"{col}_momentum")
+            ])
+            
+            # Sentiment extremes
+            df = df.with_columns([
+                (pl.col(col) > 0.7).alias(f"{col}_very_positive"),
+                (pl.col(col) < -0.7).alias(f"{col}_very_negative"),
+                (pl.col(col).abs() < 0.1).alias(f"{col}_neutral")
+            ])
         
-        logger.info("Added sentiment features")
-        
+        logger.info(f"Created sentiment features for {len(sentiment_cols)} sentiment columns")
         return df 

@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
 import polars as pl
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -105,14 +106,14 @@ class FeatureEngineer:
             DataFrame with raw data
         """
         async with self.db_manager.get_session() as session:
-            # Query raw data
-            result = await session.execute(
-                """
+            # Query raw data with proper text() wrapper
+            result = session.execute(
+                text("""
                 SELECT source, date, data
                 FROM raw_data
                 WHERE date BETWEEN :start_date AND :end_date
                 ORDER BY date, source
-                """,
+                """),
                 {'start_date': start_date, 'end_date': end_date}
             )
             
@@ -131,6 +132,10 @@ class FeatureEngineer:
             
             # Extract data based on source
             raw = record.data
+            if isinstance(raw, str):
+                import json
+                raw = json.loads(raw)
+            
             data = {
                 'date': record.date,
                 **self._extract_source_data(source, raw)
@@ -149,24 +154,23 @@ class FeatureEngineer:
                 })
                 dfs.append(df)
         
-        # Join all DataFrames on date
+        # Merge all sources on date
         if dfs:
-            result_df = dfs[0]
+            result = dfs[0]
             for df in dfs[1:]:
-                result_df = result_df.join(df, on='date', how='outer')
+                result = result.join(df, on='date', how='outer')
             
             # Sort by date
-            result_df = result_df.sort('date')
-            
-            return result_df
+            result = result.sort('date')
+            return result
         
         return pl.DataFrame()
     
-    def _extract_source_data(self, source: str, raw_data: Dict) -> Dict:
+    def _extract_source_data(self, source: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant data from raw source data.
         
         Args:
-            source: Source name
+            source: Data source name
             raw_data: Raw data dictionary
             
         Returns:
@@ -174,281 +178,266 @@ class FeatureEngineer:
         """
         if source == 'cbn_rates':
             return {
-                'official_rate': raw_data.get('official_rate'),
-                'parallel_rate': raw_data.get('parallel_rate'),
                 'buying_rate': raw_data.get('buying_rate'),
-                'selling_rate': raw_data.get('selling_rate')
+                'selling_rate': raw_data.get('selling_rate'),
+                'central_rate': raw_data.get('central_rate'),
+                'official_rate': raw_data.get('official_rate'),
+                'parallel_rate': raw_data.get('parallel_rate')
             }
-        
         elif source == 'worldbank_reserves':
             return {
                 'reserves_usd': raw_data.get('reserves_usd')
             }
-        
         elif source == 'dmo_debt':
             return {
                 'total_debt': raw_data.get('total_debt'),
                 'external_debt': raw_data.get('external_debt'),
-                'domestic_debt': raw_data.get('domestic_debt')
+                'domestic_debt': raw_data.get('domestic_debt'),
+                'debt_servicing': raw_data.get('debt_servicing')
             }
-        
         elif source == 'eia_brent':
             return {
-                'oil_price': raw_data.get('price_usd')
+                'price_usd': raw_data.get('price_usd')
             }
-        
         elif source == 'news_sentiment':
             return {
                 'sentiment_score': raw_data.get('sentiment_score'),
+                'sentiment_label': raw_data.get('sentiment_label'),
                 'relevance_score': raw_data.get('relevance_score')
             }
-        
-        return {}
+        else:
+            return {}
     
-    def _create_base_features(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _create_base_features(self, raw_data: pl.DataFrame) -> pl.DataFrame:
         """Create base features from raw data.
         
         Args:
-            df: Raw data DataFrame
+            raw_data: Raw data DataFrame
             
         Returns:
             DataFrame with base features
         """
-        # Calculate rate spreads
-        if 'cbn_rates_official_rate' in df.columns and 'cbn_rates_parallel_rate' in df.columns:
-            df = df.with_columns([
-                (pl.col('cbn_rates_parallel_rate') - pl.col('cbn_rates_official_rate'))
-                .alias('rate_spread'),
-                
-                ((pl.col('cbn_rates_parallel_rate') - pl.col('cbn_rates_official_rate')) / 
-                 pl.col('cbn_rates_official_rate') * 100)
-                .alias('rate_spread_pct')
+        if raw_data.is_empty():
+            return pl.DataFrame()
+        
+        # Start with the raw data and add derived features
+        features = raw_data.clone()
+        
+        # Add exchange rate features
+        if 'cbn_rates_central_rate' in raw_data.columns:
+            features = features.with_columns([
+                pl.col('cbn_rates_central_rate').alias('exchange_rate'),
+                pl.col('cbn_rates_parallel_rate').alias('parallel_rate'),
+                (pl.col('cbn_rates_parallel_rate') - pl.col('cbn_rates_central_rate')).alias('rate_spread'),
+                (pl.col('cbn_rates_parallel_rate') / pl.col('cbn_rates_central_rate') - 1).alias('rate_premium')
             ])
         
-        # Calculate debt ratios
-        if 'dmo_debt_external_debt' in df.columns and 'dmo_debt_total_debt' in df.columns:
-            df = df.with_columns([
-                (pl.col('dmo_debt_external_debt') / pl.col('dmo_debt_total_debt') * 100)
-                .alias('external_debt_ratio')
+        # Add oil price features
+        if 'eia_brent_price_usd' in raw_data.columns:
+            features = features.with_columns([
+                pl.col('eia_brent_price_usd').alias('oil_price')
             ])
         
-        # Forward fill missing values for non-daily data
-        df = df.fill_null(strategy='forward')
+        # Add debt features
+        if 'dmo_debt_total_debt' in raw_data.columns:
+            features = features.with_columns([
+                pl.col('dmo_debt_total_debt').alias('total_debt'),
+                pl.col('dmo_debt_external_debt').alias('external_debt'),
+                pl.col('dmo_debt_debt_servicing').alias('debt_servicing'),
+                (pl.col('dmo_debt_external_debt') / pl.col('dmo_debt_total_debt')).alias('external_debt_ratio')
+            ])
         
-        return df
+        # Add reserves features
+        if 'worldbank_reserves_reserves_usd' in raw_data.columns:
+            features = features.with_columns([
+                pl.col('worldbank_reserves_reserves_usd').alias('fx_reserves')
+            ])
+        
+        # Add sentiment features
+        if 'news_sentiment_sentiment_score' in raw_data.columns:
+            features = features.with_columns([
+                pl.col('news_sentiment_sentiment_score').alias('sentiment_score'),
+                pl.col('news_sentiment_relevance_score').alias('relevance_score')
+            ])
+        
+        return features
     
-    def _create_derived_features(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _create_derived_features(self, features: pl.DataFrame) -> pl.DataFrame:
         """Create derived features.
         
         Args:
-            df: DataFrame with base features
+            features: Input features DataFrame
             
         Returns:
             DataFrame with derived features
         """
-        # Oil price to exchange rate correlation feature
-        if 'eia_brent_oil_price' in df.columns and 'cbn_rates_official_rate' in df.columns:
-            df = df.with_columns([
-                (pl.col('eia_brent_oil_price') / pl.col('cbn_rates_official_rate'))
-                .alias('oil_to_fx_ratio')
+        if features.is_empty():
+            return features
+        
+        # Calculate percentage changes
+        numeric_cols = [col for col in features.columns if features[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
+        
+        for col in numeric_cols:
+            if col != 'date':
+                # Daily change
+                features = features.with_columns([
+                    ((pl.col(col) - pl.col(col).shift(1)) / pl.col(col).shift(1) * 100).alias(f'{col}_pct_change')
+                ])
+        
+        # Economic indicators
+        if 'exchange_rate' in features.columns and 'oil_price' in features.columns:
+            features = features.with_columns([
+                (pl.col('exchange_rate') / pl.col('oil_price')).alias('exchange_rate_per_oil'),
+                (pl.col('oil_price') * pl.col('exchange_rate')).alias('oil_price_ngn')
             ])
         
-        # Reserves to debt ratio
-        if 'worldbank_reserves_reserves_usd' in df.columns and 'dmo_debt_total_debt' in df.columns:
-            df = df.with_columns([
-                (pl.col('worldbank_reserves_reserves_usd') / pl.col('dmo_debt_total_debt'))
-                .alias('reserves_to_debt_ratio')
+        if 'fx_reserves' in features.columns and 'total_debt' in features.columns:
+            features = features.with_columns([
+                (pl.col('fx_reserves') / pl.col('total_debt')).alias('reserves_to_debt_ratio')
             ])
         
-        # Sentiment impact on rate spread
-        if 'news_sentiment_sentiment_score' in df.columns and 'rate_spread_pct' in df.columns:
-            df = df.with_columns([
-                (pl.col('news_sentiment_sentiment_score') * pl.col('rate_spread_pct'))
-                .alias('sentiment_spread_interaction')
-            ])
-        
-        return df
+        return features
     
-    def _add_time_features(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _add_time_features(self, features: pl.DataFrame) -> pl.DataFrame:
         """Add time-based features.
         
         Args:
-            df: Input DataFrame
+            features: Input features DataFrame
             
         Returns:
             DataFrame with time features
         """
-        df = df.with_columns([
-            pl.col('date').dt.year().alias('year'),
-            pl.col('date').dt.month().alias('month'),
-            pl.col('date').dt.quarter().alias('quarter'),
-            pl.col('date').dt.weekday().alias('weekday'),
-            pl.col('date').dt.ordinal_day().alias('day_of_year'),
-            
-            # Binary features
-            (pl.col('date').dt.weekday() >= 5).alias('is_weekend'),
-            (pl.col('date').dt.month() == 12).alias('is_december'),  # Year-end effects
-            (pl.col('date').dt.month() <= 3).alias('is_q1'),  # Budget season
+        if features.is_empty():
+            return features
+        
+        # Convert date to datetime for time features
+        features = features.with_columns([
+            pl.col('date').cast(pl.Datetime).alias('datetime')
         ])
         
-        # Cyclical encoding for month
-        df = df.with_columns([
+        # Add time features
+        features = features.with_columns([
+            pl.col('datetime').dt.year().alias('year'),
+            pl.col('datetime').dt.month().alias('month'),
+            pl.col('datetime').dt.day().alias('day'),
+            pl.col('datetime').dt.weekday().alias('weekday'),
+            pl.col('datetime').dt.ordinal_day().alias('day_of_year'),
+            ((pl.col('datetime').dt.month() - 1) // 3 + 1).alias('quarter')
+        ])
+        
+        # Add cyclical features
+        features = features.with_columns([
             (2 * np.pi * pl.col('month') / 12).sin().alias('month_sin'),
             (2 * np.pi * pl.col('month') / 12).cos().alias('month_cos'),
+            (2 * np.pi * pl.col('day_of_year') / 365).sin().alias('day_of_year_sin'),
+            (2 * np.pi * pl.col('day_of_year') / 365).cos().alias('day_of_year_cos')
         ])
         
-        # Cyclical encoding for day of year
-        df = df.with_columns([
-            (2 * np.pi * pl.col('day_of_year') / 365).sin().alias('day_sin'),
-            (2 * np.pi * pl.col('day_of_year') / 365).cos().alias('day_cos'),
-        ])
+        # Drop intermediate datetime column
+        features = features.drop('datetime')
         
-        return df
+        return features
     
-    def _validate_features(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Validate and clean features.
+    def _validate_features(self, features: pl.DataFrame) -> pl.DataFrame:
+        """Validate engineered features.
         
         Args:
-            df: Input DataFrame
+            features: Input features DataFrame
             
         Returns:
-            Validated DataFrame
+            Validated features DataFrame
         """
-        # Remove features with too many missing values
-        null_threshold = 0.3  # 30% threshold
-        total_rows = len(df)
+        if features.is_empty():
+            return features
         
-        cols_to_keep = []
-        for col in df.columns:
-            null_count = df[col].null_count()
-            null_ratio = null_count / total_rows
-            
-            if null_ratio <= null_threshold:
-                cols_to_keep.append(col)
-            else:
-                logger.warning(f"Dropping column {col} with {null_ratio:.2%} missing values")
+        # Remove rows with all NaN values (except date)
+        non_date_cols = [col for col in features.columns if col != 'date']
+        features = features.filter(
+            pl.any_horizontal([pl.col(col).is_not_null() for col in non_date_cols])
+        )
         
-        df = df.select(cols_to_keep)
+        # Fill forward missing values for time series
+        features = features.sort('date')
+        for col in non_date_cols:
+            if features[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]:
+                features = features.with_columns([
+                    pl.col(col).fill_null(strategy='forward').alias(col)
+                ])
         
-        # Remove rows with any missing values in critical features
-        critical_features = ['date', 'cbn_rates_official_rate']
-        critical_exists = [col for col in critical_features if col in df.columns]
-        
-        if critical_exists:
-            df = df.drop_nulls(subset=critical_exists)
-        
-        # Check for infinite values
-        numeric_cols = [col for col in df.columns if df[col].dtype in [pl.Float32, pl.Float64]]
-        
-        for col in numeric_cols:
-            # Replace infinities with nulls
-            df = df.with_columns([
-                pl.when(pl.col(col).is_infinite())
-                .then(None)
-                .otherwise(pl.col(col))
-                .alias(col)
-            ])
-        
-        # Remove duplicate dates
-        df = df.unique(subset=['date'])
-        
-        logger.info(f"Validated features: {len(df)} records, {len(df.columns)} features")
-        
-        return df
+        return features
     
     async def store_features(self, features: pl.DataFrame) -> int:
         """Store engineered features in database.
         
         Args:
-            features: DataFrame with features
+            features: Features DataFrame
             
         Returns:
             Number of records stored
         """
         if features.is_empty():
-            logger.warning("No features to store")
             return 0
         
         records_stored = 0
         
         async with self.db_manager.get_session() as session:
-            # Convert to records
-            records = features.to_dicts()
+            for row in features.iter_rows(named=True):
+                # Convert to feature vector
+                feature_vector = {
+                    col: val for col, val in row.items() 
+                    if col != 'date' and val is not None
+                }
+                
+                # Create feature record
+                feature_record = FeatureModel(
+                    date=row['date'],
+                    feature_vector=feature_vector,
+                    feature_count=len(feature_vector),
+                    is_complete=True,
+                    quality_score=1.0  # Will be updated by validation
+                )
+                
+                session.add(feature_record)
+                records_stored += 1
             
-            for record in records:
-                try:
-                    # Extract date and remove from features
-                    feature_date = record.pop('date')
-                    
-                    # Create feature model
-                    feature_model = FeatureModel(
-                        date=feature_date,
-                        feature_vector=record,
-                        feature_version=self.settings.features.version,
-                        feature_count=len(record)
-                    )
-                    
-                    session.add(feature_model)
-                    records_stored += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error storing feature record: {e}")
-                    continue
-            
-            # Commit all records
-            await session.commit()
+            session.commit()
         
         logger.info(f"Stored {records_stored} feature records")
         return records_stored
     
-    async def get_latest_features(
-        self,
-        days: int = 30
-    ) -> pl.DataFrame:
+    async def get_latest_features(self, n_days: int = 30) -> pl.DataFrame:
         """Get latest engineered features.
         
         Args:
-            days: Number of days to retrieve
+            n_days: Number of days to retrieve
             
         Returns:
-            DataFrame with features
+            DataFrame with latest features
         """
         end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+        start_date = end_date - timedelta(days=n_days)
         
         async with self.db_manager.get_session() as session:
-            result = await session.execute(
-                """
+            result = session.execute(
+                text("""
                 SELECT date, feature_vector
                 FROM features
                 WHERE date BETWEEN :start_date AND :end_date
-                AND feature_version = :version
                 ORDER BY date DESC
-                """,
-                {
-                    'start_date': start_date,
-                    'end_date': end_date,
-                    'version': self.settings.features.version
-                }
+                """),
+                {'start_date': start_date, 'end_date': end_date}
             )
             
             records = result.fetchall()
         
         if not records:
-            logger.warning("No features found in database")
             return pl.DataFrame()
         
         # Convert to DataFrame
         data = []
         for record in records:
-            features = record.feature_vector
-            features['date'] = record.date
-            data.append(features)
+            row = {'date': record.date}
+            row.update(record.feature_vector)
+            data.append(row)
         
-        df = pl.DataFrame(data)
-        
-        # Reorder columns with date first
-        cols = ['date'] + [col for col in df.columns if col != 'date']
-        df = df.select(cols)
-        
-        return df.sort('date') 
+        return pl.DataFrame(data) 
